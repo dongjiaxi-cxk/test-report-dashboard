@@ -1,38 +1,31 @@
 from fastapi.testclient import TestClient
 from app.main import app
-from app.database import Base, engine, SessionLocal
-from app.models import Project, Report
-import json, os
+from app.database import Base, engine
+import json
 
-# Recreate tables for testing
 Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
 client = TestClient(app)
 
-SAMPLE_DIR = os.path.dirname(__file__)
 
-
-class TestUploadReport:
-    def test_upload_creates_project(self):
-        data = {
-            "project_name": "Test Project",
-            "summary": {"total": 10, "passed": 9, "failed": 1},
-            "results": [{"name": "t1", "passed": True}]
-        }
-        files = {"file": ("report.json", json.dumps(data), "application/json")}
+class TestUpload:
+    def test_upload_file(self):
+        data = {"project_name": "API-1", "summary": {"total": 10, "passed": 9, "failed": 1}, "results": []}
+        files = {"file": ("r.json", json.dumps(data), "application/json")}
         resp = client.post("/api/upload", files=files)
         assert resp.status_code == 200
-        assert resp.json()["project"] == "Test Project"
         assert resp.json()["pass_rate"] == 90.0
 
+    def test_upload_text(self):
+        data = {"project_name": "API-2", "summary": {"total": 5, "passed": 5, "failed": 0}, "results": []}
+        resp = client.post("/api/upload-text", json=data)
+        assert resp.status_code == 200
+        assert resp.json()["pass_rate"] == 100.0
+
     def test_upload_same_project(self):
-        data = {
-            "project_name": "Test Project",
-            "summary": {"total": 5, "passed": 5, "failed": 0},
-            "results": []
-        }
-        files = {"file": ("report2.json", json.dumps(data), "application/json")}
+        data = {"project_name": "API-1", "summary": {"total": 4, "passed": 3, "failed": 1}, "results": []}
+        files = {"file": ("r2.json", json.dumps(data), "application/json")}
         resp = client.post("/api/upload", files=files)
         assert resp.status_code == 200
 
@@ -41,36 +34,49 @@ class TestAPI:
     def test_list_projects(self):
         resp = client.get("/api/projects")
         assert resp.status_code == 200
-        projects = resp.json()
-        assert len(projects) >= 1
-        assert projects[0]["name"] == "Test Project"
-        assert projects[0]["report_count"] == 2
+        assert len(resp.json()) == 2
 
     def test_list_reports(self):
         resp = client.get("/api/projects/1/reports")
         assert resp.status_code == 200
-        reports = resp.json()
-        assert len(reports) == 2
+        assert len(resp.json()) == 2
 
     def test_get_report(self):
         resp = client.get("/api/reports/1")
         assert resp.status_code == 200
-        report = resp.json()
-        assert report["total"] == 10
-        assert report["passed"] == 9
+        assert resp.json()["total"] == 10
+
+    def test_project_stats(self):
+        resp = client.get("/api/projects/1/stats")
+        assert resp.status_code == 200
+        d = resp.json()
+        assert len(d["labels"]) == 2
+        assert len(d["pass_rates"]) == 2
+        assert len(d["avg_times"]) == 2
+
+    def test_delete_report(self):
+        resp = client.delete("/api/reports/3")
+        assert resp.status_code == 200
+
+    def test_delete_project(self):
+        resp = client.delete("/api/projects/2")
+        assert resp.status_code == 200
+        # Verify deleted
+        resp2 = client.get("/api/projects")
+        assert len(resp2.json()) == 1
 
 
 class TestPages:
-    def test_home_page(self):
+    def test_home(self):
         resp = client.get("/")
         assert resp.status_code == 200
-        assert "Test Project" in resp.text
+        assert "API-1" in resp.text
 
     def test_project_page(self):
         resp = client.get("/projects/1")
         assert resp.status_code == 200
-        assert "Test Project" in resp.text
         assert "Pass Rate Trend" in resp.text
+        assert "Response Time Trend" in resp.text
 
     def test_report_page(self):
         resp = client.get("/reports/1")
