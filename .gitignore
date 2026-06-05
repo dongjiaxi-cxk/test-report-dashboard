@@ -1,0 +1,6 @@
+﻿__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+test_reports.db
+sample_report.json
