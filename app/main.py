@@ -208,6 +208,29 @@ def delete_report(report_id: int, db: Session = Depends(get_db)):
 
 # ---- HTML Pages ----
 
+
+@app.get("/api/projects/{project_id}/regression")
+def regression_check(project_id: int, threshold: float = 5.0, db: Session = Depends(get_db)):
+    """Check for regression: compare latest two reports, flag if pass rate dropped."""
+    reports = db.query(Report).filter(
+        Report.project_id == project_id
+    ).order_by(desc(Report.uploaded_at)).limit(2).all()
+
+    if len(reports) < 2:
+        return {"regression": False, "message": "Need at least 2 reports to compare", "delta": 0}
+
+    latest, previous = reports[0], reports[1]
+    delta = round(previous.pass_rate - latest.pass_rate, 1)
+    regression = delta > threshold
+
+    return {
+        "regression": regression,
+        "delta": delta,
+        "threshold": threshold,
+        "latest": {"id": latest.id, "date": latest.uploaded_at.isoformat(), "pass_rate": latest.pass_rate},
+        "previous": {"id": previous.id, "date": previous.uploaded_at.isoformat(), "pass_rate": previous.pass_rate},
+    }
+
 PAGE_HEAD = """<!DOCTYPE html>
 <html lang="en">
 <head>
