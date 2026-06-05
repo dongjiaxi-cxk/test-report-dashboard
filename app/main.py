@@ -1,10 +1,10 @@
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Depends, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, UploadFile, File, Depends, Request, Form, Query
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
-import json, os
+import csv, io, json, os
 
 from .database import engine, get_db, Base
 from .models import Project, Report
@@ -18,8 +18,10 @@ static_dir = os.path.join(os.path.dirname(__file__), "static")
 os.makedirs(static_dir, exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+PAGE_SIZE = 20
 
-# ─── Helpers ────────────────────────────────────────────────────────
+
+# ---- Helpers ----
 
 def process_upload(data: dict, db: Session):
     project_name = data.get("project_name", "Unnamed")
@@ -50,14 +52,19 @@ def process_upload(data: dict, db: Session):
     return report, project_name, pass_rate
 
 
-# ─── API Routes ───────────────────────────────────────────────────
+# ---- API Routes ----
 
 @app.get("/api/projects")
-def list_projects(db: Session = Depends(get_db)):
-    projects = db.query(Project).all()
+def list_projects(search: str = Query(default=""), db: Session = Depends(get_db)):
+    query = db.query(Project)
+    if search:
+        query = query.filter(Project.name.ilike(f"%{search}%"))
+    projects = query.all()
     result = []
     for p in projects:
-        latest = db.query(Report).filter(Report.project_id == p.id).order_by(desc(Report.uploaded_at)).first()
+        latest = db.query(Report).filter(
+            Report.project_id == p.id
+        ).order_by(desc(Report.uploaded_at)).first()
         count = db.query(Report).filter(Report.project_id == p.id).count()
         result.append(ProjectOut(
             id=p.id, name=p.name, description=p.description or "",
@@ -70,7 +77,83 @@ def list_projects(db: Session = Depends(get_db)):
 
 @app.get("/api/projects/{project_id}/reports")
 def list_reports(project_id: int, db: Session = Depends(get_db)):
-    return db.query(Report).filter(Report.project_id == project_id).order_by(desc(Report.uploaded_at)).all()
+    return db.query(Report).filter(
+        Report.project_id == project_id
+    ).order_by(desc(Report.uploaded_at)).all()
+
+
+@app.get("/api/projects/{project_id}/stats")
+def project_stats(project_id: int, db: Session = Depends(get_db)):
+    reports = db.query(Report).filter(
+        Report.project_id == project_id
+    ).order_by(Report.uploaded_at).all()
+    return {
+        "labels": [r.uploaded_at.strftime("%m-%d %H:%M") for r in reports],
+        "pass_rates": [r.pass_rate for r in reports],
+        "avg_times": [r.total_time_ms for r in reports],
+    }
+
+
+@app.get("/api/projects/{project_id}/export")
+def export_reports(project_id: int, fmt: str = Query(default="json"), db: Session = Depends(get_db)):
+    reports = db.query(Report).filter(
+        Report.project_id == project_id
+    ).order_by(Report.uploaded_at).all()
+    project = db.query(Project).filter(Project.id == project_id).first()
+    name = project.name if project else "unknown"
+
+    if fmt == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Date", "Total", "Passed", "Failed", "Pass Rate", "Time (ms)"])
+        for r in reports:
+            writer.writerow([
+                r.uploaded_at.isoformat(), r.total, r.passed, r.failed,
+                r.pass_rate, r.total_time_ms,
+            ])
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={name}_reports.csv"},
+        )
+    else:
+        data = {
+            "project": name,
+            "reports": [
+                {
+                    "date": r.uploaded_at.isoformat(),
+                    "total": r.total,
+                    "passed": r.passed,
+                    "failed": r.failed,
+                    "pass_rate": r.pass_rate,
+                    "total_time_ms": r.total_time_ms,
+                    "results": r.raw_data.get("results", []) if r.raw_data else [],
+                }
+                for r in reports
+            ],
+        }
+        return data
+
+
+@app.get("/api/compare/{report_id_a}/{report_id_b}")
+def compare_reports(report_id_a: int, report_id_b: int, db: Session = Depends(get_db)):
+    ra = db.query(Report).filter(Report.id == report_id_a).first()
+    rb = db.query(Report).filter(Report.id == report_id_b).first()
+    if not ra or not rb:
+        return {"error": "One or both reports not found"}
+    return {
+        "a": {"id": ra.id, "date": ra.uploaded_at.isoformat(), "total": ra.total,
+              "passed": ra.passed, "failed": ra.failed, "pass_rate": ra.pass_rate},
+        "b": {"id": rb.id, "date": rb.uploaded_at.isoformat(), "total": rb.total,
+              "passed": rb.passed, "failed": rb.failed, "pass_rate": rb.pass_rate},
+        "delta": {
+            "pass_rate": round(rb.pass_rate - ra.pass_rate, 1),
+            "total_time_ms": round((rb.total_time_ms or 0) - (ra.total_time_ms or 0), 1),
+            "passed": rb.passed - ra.passed,
+            "failed": rb.failed - ra.failed,
+        },
+    }
 
 
 @app.get("/api/reports/{report_id}")
@@ -88,7 +171,6 @@ def get_report(report_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/upload")
 async def upload_report(file: UploadFile = File(None), db: Session = Depends(get_db)):
-    """Upload via file."""
     if not file:
         return {"error": "No file provided"}
     content = await file.read()
@@ -99,7 +181,6 @@ async def upload_report(file: UploadFile = File(None), db: Session = Depends(get
 
 @app.post("/api/upload-text")
 async def upload_text(request: Request, db: Session = Depends(get_db)):
-    """Upload via JSON text."""
     body = await request.json()
     report, name, rate = process_upload(body, db)
     return {"id": report.id, "project": name, "pass_rate": rate}
@@ -120,31 +201,12 @@ def delete_report(report_id: int, db: Session = Depends(get_db)):
     report = db.query(Report).filter(Report.id == report_id).first()
     if not report:
         return {"error": "Not found"}
-    pid = report.project_id
     db.delete(report)
     db.commit()
-    count = db.query(Report).filter(Report.project_id == pid).count()
-    if count == 0:
-        db.query(Project).filter(Project.id == pid).delete()
-        db.commit()
     return {"deleted": report_id}
 
 
-@app.get("/api/projects/{project_id}/stats")
-def project_stats(project_id: int, db: Session = Depends(get_db)):
-    """Get trend data for a project."""
-    reports = db.query(Report).filter(Report.project_id == project_id).order_by(Report.uploaded_at).all()
-    return {
-        "labels": [r.uploaded_at.strftime("%m-%d %H:%M") for r in reports],
-        "pass_rates": [r.pass_rate for r in reports],
-        "avg_times": [round(r.total_time_ms / r.total, 1) if r.total > 0 else 0 for r in reports],
-        "totals": [r.total for r in reports],
-        "passed": [r.passed for r in reports],
-        "failed": [r.failed for r in reports],
-    }
-
-
-# ─── Frontend Pages ───────────────────────────────────────────────
+# ---- HTML Pages ----
 
 PAGE_HEAD = """<!DOCTYPE html>
 <html lang="en">
@@ -154,168 +216,185 @@ PAGE_HEAD = """<!DOCTYPE html>
 <title>Test Report Dashboard</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f7fa;color:#333}
-nav{background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:20px 40px;display:flex;justify-content:space-between;align-items:center}
-nav h1{font-size:20px}
-nav a{color:white;text-decoration:none;opacity:.9;margin-left:16px}
-nav a:hover{opacity:1}
-.container{max-width:1000px;margin:30px auto;padding:0 20px}
-.card{background:white;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.08);padding:24px;margin-bottom:20px}
-.card h2{margin-bottom:16px;font-size:18px}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333}
+.container{max-width:1100px;margin:0 auto;padding:30px 20px}
+nav{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:20px 30px;border-radius:12px;margin-bottom:20px}
+nav h1{font-size:22px}nav a{color:#fff;text-decoration:none}nav a:hover{text-decoration:underline}
 .stats{display:flex;gap:15px;margin-bottom:20px;flex-wrap:wrap}
-.stat{flex:1;min-width:120px;background:white;padding:20px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.08);text-align:center}
-.stat .num{font-size:28px;font-weight:bold}
-.stat .label{color:#888;font-size:13px;margin-top:4px}
+.stat{flex:1;min-width:140px;background:#fff;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.08);text-align:center}
+.stat .num{font-size:28px;font-weight:bold}.stat .label{font-size:13px;color:#888;margin-top:4px}
+.card{background:#fff;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.08);padding:20px;margin-bottom:20px}
+.card h2{font-size:16px;margin-bottom:15px;color:#555}
 table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:12px 16px;border-bottom:1px solid #f1f5f9}
-th{font-size:12px;text-transform:uppercase;color:#888}
-td{font-size:14px}
-td a{color:#667eea;text-decoration:none}
-td a:hover{text-decoration:underline}
-button,.btn{background:#667eea;color:white;border:none;padding:10px 24px;border-radius:6px;cursor:pointer;font-size:14px;text-decoration:none;display:inline-block}
-button:hover,.btn:hover{background:#5a6fd6}
-.btn-danger{background:#ef4444}
-.btn-danger:hover{background:#dc2626}
-.btn-sm{padding:5px 12px;font-size:12px}
-form{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap}
-textarea,input[type="file"]{padding:8px;border:1px solid #ddd;border-radius:6px;font-size:14px}
-textarea{width:100%;min-height:120px;font-family:monospace;font-size:12px}
-.tabs{display:flex;gap:0;margin-bottom:20px}
-.tab{padding:8px 20px;background:#e5e7eb;border-radius:8px 8px 0 0;cursor:pointer;font-size:14px}
-.tab.active{background:#667eea;color:white}
-canvas{max-width:100%}
-#status{margin-top:10px;font-size:14px;padding:8px 16px;border-radius:6px}
-#status.success{background:#dcfce7;color:#16a34a}
-#status.error{background:#fee2e2;color:#dc2626}
+th{background:#f8fafc;text-align:left;padding:10px 14px;font-size:12px;text-transform:uppercase;color:#888}
+td{padding:10px 14px;border-top:1px solid #f1f5f9;font-size:14px}
+.btn{padding:8px 18px;border:none;border-radius:6px;cursor:pointer;font-size:14px}
+.btn-primary{background:#667eea;color:#fff}
+.btn-danger{background:#ef4444;color:#fff;padding:6px 12px;font-size:12px}
+.btn-sm{padding:5px 10px;font-size:12px}
+.btn-success{background:#22c55e;color:#fff;padding:6px 12px;font-size:12px}
+.btn-outline{padding:6px 12px;font-size:12px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer}
+.search-box{padding:8px 14px;border:1px solid #ddd;border-radius:6px;font-size:14px;width:250px}
+.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:15px;flex-wrap:wrap}
+.pagination{display:flex;gap:8px;justify-content:center;margin-top:15px}
+.pagination button{padding:6px 14px;border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer}
+.pagination button.active{background:#667eea;color:#fff;border-color:#667eea}
+.empty-state{text-align:center;padding:60px 20px;color:#888}
+.empty-state h2{font-size:20px;margin-bottom:10px;color:#666}
+.empty-state p{font-size:14px;margin-bottom:20px}
+input[type=file]{font-size:14px}
+.compare-grid{display:grid;grid-template-columns:1fr auto 1fr;gap:20px;align-items:center}
+.compare-card{text-align:center;padding:15px;background:#f8fafc;border-radius:8px}
+.compare-delta{font-size:14px;font-weight:bold}
+.compare-delta.up{color:#22c55e}.compare-delta.down{color:#ef4444}
 </style>
 </head>
-<body>
-<nav>
-    <h1><a href="/">Test Report Dashboard</a></h1>
-    <div><a href="/api/projects">API</a></div>
-</nav>
-<div class="container">
+<body><div class="container">
 """
 
-PAGE_FOOT = """</div>
-</body>
-</html>"""
+PAGE_FOOT = """</div></body></html>"""
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(db: Session = Depends(get_db)):
-    projects = db.query(Project).all()
-    rows = ""
-    for p in projects:
-        count = db.query(Report).filter(Report.project_id == p.id).count()
-        latest = db.query(Report).filter(Report.project_id == p.id).order_by(desc(Report.uploaded_at)).first()
-        rate = f"{latest.pass_rate:.0f}%" if latest else "-"
-        color = "#22c55e" if latest and latest.pass_rate >= 90 else ("#ef4444" if latest and latest.pass_rate < 80 else "#f59e0b")
-        date_str = latest.uploaded_at.strftime("%Y-%m-%d %H:%M") if latest else "-"
-        rows += f"""<tr>
-            <td><a href="/projects/{p.id}">{p.name}</a></td>
-            <td>{p.description or ""}</td>
-            <td>{count}</td>
-            <td><span style="color:{color};font-weight:bold">{rate}</span></td>
-            <td>{date_str}</td>
-            <td><button class="btn-danger btn-sm" onclick="delProject({p.id})">Delete</button></td>
-        </tr>"""
+async def home(request: Request, search: str = Query(default=""), db: Session = Depends(get_db)):
+    query = db.query(Project)
+    if search:
+        query = query.filter(Project.name.ilike(f"%{search}%"))
+    projects = query.order_by(Project.created_at.desc()).all()
 
-    html = PAGE_HEAD + """
-<div class="tabs">
-    <div class="tab active" onclick="showTab('file')">File Upload</div>
-    <div class="tab" onclick="showTab('text')">Paste JSON</div>
-</div>
-<div class="card" id="tab-file">
-    <h2>Upload Report File</h2>
-    <form id="uploadForm" enctype="multipart/form-data">
-        <input type="file" id="file" name="file" accept=".json">
-        <button type="submit">Upload</button>
-    </form>
-    <div id="status"></div>
-</div>
-<div class="card" id="tab-text" style="display:none">
-    <h2>Paste JSON Report</h2>
-    <form id="textForm">
-        <textarea id="jsonText" placeholder='{"project_name": "My API", "summary": {"total": 10, "passed": 9, "failed": 1}, "results": [...]}'></textarea>
-        <button type="submit">Submit</button>
-    </form>
-    <div id="status2"></div>
+    total_reports = db.query(Report).count()
+    avg_rate = db.query(func.avg(Report.pass_rate)).scalar() or 0
+
+    rows = ""
+    if projects:
+        for p in projects:
+            latest = db.query(Report).filter(
+                Report.project_id == p.id
+            ).order_by(desc(Report.uploaded_at)).first()
+            count = db.query(Report).filter(Report.project_id == p.id).count()
+            rate = latest.pass_rate if latest else None
+            date_str = latest.uploaded_at.strftime("%Y-%m-%d %H:%M") if latest and latest.uploaded_at else "-"
+            color = "#22c55e" if rate and rate >= 90 else ("#ef4444" if rate and rate < 80 else "#f59e0b")
+            rate_display = f"{rate:.0f}%" if rate is not None else "-"
+            rows += f"""<tr>
+                <td><a href="/projects/{p.id}" style="color:#667eea;font-weight:bold;text-decoration:none">{p.name}</a></td>
+                <td>{count}</td>
+                <td style="color:{color};font-weight:bold">{rate_display}</td>"""
+            rows += f"""
+                <td style="font-size:13px;color:#888">{date_str}</td>
+                <td>
+                    <button class="btn-outline" onclick="location.href='/projects/{p.id}'">View</button>
+                    <button class="btn-danger btn-sm" onclick="delProject({p.id})">Del</button>
+                </td>
+            </tr>"""
+    else:
+        rows = """<tr><td colspan="5" style="text-align:center;padding:40px;color:#888">
+            No projects yet. Upload a JSON report to get started.</td></tr>"""
+
+    html = PAGE_HEAD + f"""
+<nav style="margin:-30px -20px 20px">
+    <h1>Test Report Dashboard</h1>
+</nav>
+<div class="stats">
+    <div class="stat"><div class="num" style="color:#667eea">{len(projects)}</div><div class="label">Projects</div></div>
+    <div class="stat"><div class="num" style="color:#22c55e">{total_reports}</div><div class="label">Total Reports</div></div>
+    <div class="stat"><div class="num" style="color:#f59e0b">{avg_rate:.0f}%</div><div class="label">Avg Pass Rate</div></div>
 </div>
 <div class="card">
-    <h2>Projects</h2>
+    <div class="toolbar">
+        <h2>Projects</h2>
+        <input type="text" class="search-box" placeholder="Search projects..." value="{search}"
+               oninput="location.search='?search='+encodeURIComponent(this.value)">
+        <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">+ Upload JSON</button>
+        <form id="uploadForm" action="/api/upload" method="post" enctype="multipart/form-data" style="display:none">
+            <input id="fileInput" type="file" name="file" accept=".json" onchange="uploadFile(this)">
+        </form>
+        <div id="pasteArea" style="display:none;margin-top:10px;width:100%">
+            <textarea id="pasteText" placeholder='Paste JSON report data...' style="width:100%;height:100px;padding:8px;border:1px solid #ddd;border-radius:6px;font-family:monospace;font-size:13px"></textarea>
+            <button class="btn btn-success" onclick="pasteUpload()" style="margin-top:5px">Submit Pasted JSON</button>
+            <button class="btn-outline" onclick="document.getElementById('pasteArea').style.display='none'" style="margin-top:5px">Cancel</button>
+        </div>
+        <button class="btn-outline" onclick="document.getElementById('pasteArea').style.display='block'" style="margin-left:5px">Paste JSON</button>
+    </div>
     <table>
-    <thead><tr><th>Project</th><th>Description</th><th>Reports</th><th>Latest Rate</th><th>Last Run</th><th></th></tr></thead>
-    <tbody>""" + rows + """</tbody>
+    <thead><tr><th>Project</th><th>Reports</th><th>Latest Rate</th><th>Last Run</th><th>Actions</th></tr></thead>
+    <tbody>{rows}</tbody>
     </table>
 </div>
 <script>
-function showTab(name) {
-    document.getElementById('tab-file').style.display = name==='file'?'block':'none';
-    document.getElementById('tab-text').style.display = name==='text'?'block':'none';
-    document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',(i===0&&name==='file')||(i===1&&name==='text')));
-}
-document.getElementById('uploadForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
+async function uploadFile(input) {{
+    if(!input.files[0]) return;
     const fd = new FormData();
-    fd.append('file', document.getElementById('file').files[0]);
-    const r = await fetch('/api/upload', {method:'POST',body:fd});
-    const d = await r.json();
-    const s = document.getElementById('status');
-    if(d.error) { s.className='error'; s.textContent=d.error; }
-    else { s.className='success'; s.textContent='Uploaded! Pass rate: '+d.pass_rate+'%'; setTimeout(()=>location.reload(),1000); }
-});
-document.getElementById('textForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    try {
-        const data = JSON.parse(document.getElementById('jsonText').value);
-        const r = await fetch('/api/upload-text', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-        const d = await r.json();
-        const s = document.getElementById('status2');
-        if(d.error) { s.className='error'; s.textContent=d.error; }
-        else { s.className='success'; s.textContent='Uploaded! Pass rate: '+d.pass_rate+'%'; setTimeout(()=>location.reload(),1000); }
-    } catch(err) { document.getElementById('status2').className='error'; document.getElementById('status2').textContent='Invalid JSON'; }
-});
-async function delProject(id) {
-    if(!confirm('Delete this project and all its reports?')) return;
-    await fetch('/api/projects/'+id, {method:'DELETE'});
+    fd.append('file', input.files[0]);
+    await fetch('/api/upload', {{method:'POST',body:fd}});
     location.reload();
-}
+}}
+async function pasteUpload() {{
+    const text = document.getElementById('pasteText').value;
+    if(!text) return;
+    await fetch('/api/upload-text', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:text}});
+    location.reload();
+}}
+async function delProject(id) {{
+    if(!confirm('Delete this project and all its reports?')) return;
+    await fetch('/api/projects/'+id, {{method:'DELETE'}});
+    location.reload();
+}}
 </script>
 """ + PAGE_FOOT
     return html
 
 
 @app.get("/projects/{project_id}", response_class=HTMLResponse)
-async def project_detail(project_id: int, db: Session = Depends(get_db)):
+async def project_detail(project_id: int, request: Request,
+                         page: int = Query(default=1, ge=1),
+                         db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         return HTMLResponse("<h2>Not Found</h2>", status_code=404)
 
-    reports = db.query(Report).filter(Report.project_id == project_id).order_by(Report.uploaded_at).all()
+    all_reports = db.query(Report).filter(
+        Report.project_id == project_id
+    ).order_by(desc(Report.uploaded_at)).all()
+
+    total_pages = max(1, (len(all_reports) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(page, total_pages)
+    start = (page - 1) * PAGE_SIZE
+    page_reports = all_reports[start:start + PAGE_SIZE]
 
     rows = ""
-    for r in reversed(reports):
+    for r in page_reports:
         color = "#22c55e" if r.pass_rate >= 90 else ("#ef4444" if r.pass_rate < 80 else "#f59e0b")
         rows += f"""<tr>
-            <td><a href="/reports/{r.id}">{r.uploaded_at.strftime("%Y-%m-%d %H:%M")}</a></td>
+            <td><a href="/reports/{r.id}" style="color:#667eea">{r.uploaded_at.strftime("%Y-%m-%d %H:%M")}</a></td>
             <td>{r.total}</td>
             <td style="color:#22c55e">{r.passed}</td>
             <td style="color:#ef4444">{r.failed}</td>
             <td><span style="color:{color};font-weight:bold">{r.pass_rate:.0f}%</span></td>
             <td>{r.total_time_ms:.0f}ms</td>
-            <td><button class="btn-danger btn-sm" onclick="delReport({r.id})">Del</button></td>
+            <td>
+                <button class="btn-sm" style="background:#667eea;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-right:4px"
+                        onclick="selectCompare({r.id})">Compare</button>
+                <button class="btn-danger btn-sm" onclick="delReport({r.id})">Del</button>
+            </td>
         </tr>"""
 
-    latest_rate = reports[-1].pass_rate if reports else 0
-    avg_time = round(sum(r.total_time_ms for r in reports) / len(reports), 1) if reports else 0
+    # Pagination buttons
+    pagination = ""
+    if total_pages > 1:
+        for i in range(1, total_pages + 1):
+            cls = "active" if i == page else ""
+            pagination += f'<button class="{cls}" onclick="location.href=\'?page={i}\'">{i}</button>'
+
+    latest_rate = all_reports[0].pass_rate if all_reports else 0
+    avg_time = round(sum(r.total_time_ms for r in all_reports) / len(all_reports), 1) if all_reports else 0
 
     html = PAGE_HEAD + f"""
 <nav style="margin:-30px -20px 20px">
     <h1><a href="/">Dashboard</a> / {project.name}</h1>
 </nav>
 <div class="stats">
-    <div class="stat"><div class="num" style="color:#667eea">{len(reports)}</div><div class="label">Reports</div></div>
+    <div class="stat"><div class="num" style="color:#667eea">{len(all_reports)}</div><div class="label">Reports</div></div>
     <div class="stat"><div class="num" style="color:#22c55e">{latest_rate:.0f}%</div><div class="label">Latest Rate</div></div>
     <div class="stat"><div class="num" style="color:#f59e0b">{avg_time}ms</div><div class="label">Avg Time</div></div>
 </div>
@@ -328,11 +407,17 @@ async def project_detail(project_id: int, db: Session = Depends(get_db)):
     <canvas id="timeChart"></canvas>
 </div>
 <div class="card">
-    <h2>Reports</h2>
+    <div class="toolbar">
+        <h2>Reports</h2>
+        <a href="/api/projects/{project_id}/export?fmt=csv" class="btn-outline" style="text-decoration:none">Export CSV</a>
+        <a href="/api/projects/{project_id}/export?fmt=json" class="btn-outline" style="text-decoration:none">Export JSON</a>
+        <span id="compareInfo" style="font-size:13px;color:#888;margin-left:10px"></span>
+    </div>
     <table>
-    <thead><tr><th>Date</th><th>Total</th><th>Passed</th><th>Failed</th><th>Rate</th><th>Time</th><th></th></tr></thead>
+    <thead><tr><th>Date</th><th>Total</th><th>Passed</th><th>Failed</th><th>Rate</th><th>Time</th><th>Actions</th></tr></thead>
     <tbody>{rows}</tbody>
     </table>
+    <div class="pagination">{pagination}</div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
@@ -347,8 +432,69 @@ async function loadCharts() {{
     new Chart(document.getElementById('timeChart'), opts('avg_times','#f59e0b'));
 }}
 loadCharts();
+let compareA = null;
+function selectCompare(id) {{
+    if(!compareA) {{ compareA = id; document.getElementById('compareInfo').textContent = 'Selected #'+id+'. Now click Compare on another report.'; }}
+    else if(compareA === id) {{ compareA = null; document.getElementById('compareInfo').textContent = ''; }}
+    else {{ location.href = '/compare/'+compareA+'/'+id; compareA = null; }}
+}}
 async function delReport(id) {{ if(!confirm('Delete this report?')) return; await fetch('/api/reports/'+id,{{method:'DELETE'}}); location.reload(); }}
 </script>
+""" + PAGE_FOOT
+    return html
+
+
+@app.get("/compare/{report_id_a}/{report_id_b}", response_class=HTMLResponse)
+async def compare_page(report_id_a: int, report_id_b: int, db: Session = Depends(get_db)):
+    ra = db.query(Report).filter(Report.id == report_id_a).first()
+    rb = db.query(Report).filter(Report.id == report_id_b).first()
+    if not ra or not rb:
+        return HTMLResponse("<h2>Reports not found</h2>", status_code=404)
+
+    pa = db.query(Project).filter(Project.id == ra.project_id).first()
+    pb = db.query(Project).filter(Project.id == rb.project_id).first()
+
+    def color_class(val):
+        return "up" if val > 0 else "down" if val < 0 else ""
+
+    delta_pass = round(rb.pass_rate - ra.pass_rate, 1)
+    delta_time = round((rb.total_time_ms or 0) - (ra.total_time_ms or 0), 1)
+
+    html = PAGE_HEAD + f"""
+<nav style="margin:-30px -20px 20px">
+    <h1><a href="/">Dashboard</a> / Compare Reports</h1>
+</nav>
+<div class="compare-grid">
+    <div class="compare-card">
+        <h3>Report A</h3>
+        <p style="color:#888;font-size:13px">{ra.uploaded_at.strftime("%Y-%m-%d %H:%M")}</p>
+        <p>Project: {pa.name if pa else '?'}</p>
+        <div class="stat"><div class="num">{ra.total}</div><div class="label">Total</div></div>
+        <div class="stat"><div class="num" style="color:#22c55e">{ra.passed}</div><div class="label">Passed</div></div>
+        <div class="stat"><div class="num" style="color:#ef4444">{ra.failed}</div><div class="label">Failed</div></div>
+        <div class="stat"><div class="num">{ra.pass_rate:.0f}%</div><div class="label">Pass Rate</div></div>
+        <div class="stat"><div class="num">{ra.total_time_ms:.0f}ms</div><div class="label">Time</div></div>
+    </div>
+    <div style="text-align:center;font-size:24px;color:#888">vs</div>
+    <div class="compare-card">
+        <h3>Report B</h3>
+        <p style="color:#888;font-size:13px">{rb.uploaded_at.strftime("%Y-%m-%d %H:%M")}</p>
+        <p>Project: {pb.name if pb else '?'}</p>
+        <div class="stat"><div class="num">{rb.total}</div><div class="label">Total</div></div>
+        <div class="stat"><div class="num" style="color:#22c55e">{rb.passed}</div><div class="label">Passed</div></div>
+        <div class="stat"><div class="num" style="color:#ef4444">{rb.failed}</div><div class="label">Failed</div></div>
+        <div class="stat"><div class="num">{rb.pass_rate:.0f}%</div><div class="label">Pass Rate</div></div>
+        <div class="stat"><div class="num">{rb.total_time_ms:.0f}ms</div><div class="label">Time</div></div>
+    </div>
+</div>
+<div class="card" style="margin-top:20px">
+    <h2>Delta (B - A)</h2>
+    <div class="stats">
+        <div class="stat"><div class="num">{rb.total - ra.total}</div><div class="label">Total Diff</div></div>
+        <div class="stat"><div class="num" style="color:{'#22c55e' if delta_pass > 0 else '#ef4444' if delta_pass < 0 else '#888'}">{delta_pass:+.1f}%</div><div class="label">Pass Rate</div></div>
+        <div class="stat"><div class="num" style="color:{'#ef4444' if delta_time > 0 else '#22c55e' if delta_time < 0 else '#888'}">{delta_time:+.0f}ms</div><div class="label">Response Time</div></div>
+    </div>
+</div>
 """ + PAGE_FOOT
     return html
 
