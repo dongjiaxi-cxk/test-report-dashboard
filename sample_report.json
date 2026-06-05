@@ -1,0 +1,12 @@
+{
+    "project_name": "Petstore API",
+    "timestamp": "2026-06-05T10:42:19",
+    "summary": {"total": 4, "passed": 4, "failed": 0},
+    "total_time_ms": 5490,
+    "results": [
+        {"name": "findPetsByStatus", "method": "GET", "path": "/pet/findByStatus", "passed": true, "status_code": 200, "response_time_ms": 1325, "messages": ["[PASS] Status: 200", "[PASS] Schema valid"]},
+        {"name": "getPetById", "method": "GET", "path": "/pet/{petId}", "passed": true, "status_code": 200, "response_time_ms": 1162, "messages": ["[PASS] Status: 200", "[PASS] Schema valid"]},
+        {"name": "getInventory", "method": "GET", "path": "/store/inventory", "passed": true, "status_code": 200, "response_time_ms": 1251, "messages": ["[PASS] Status: 200", "[PASS] Schema valid"]},
+        {"name": "loginUser", "method": "GET", "path": "/user/login", "passed": true, "status_code": 200, "response_time_ms": 1175, "messages": ["[PASS] Status: 200", "[PASS] Schema valid"]}
+    ]
+}
