@@ -1,52 +1,86 @@
 # Test Report Dashboard
 
-Web dashboard for managing and visualizing API test reports. Upload JSON reports, track pass rates over time, and drill into individual test results.
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688.svg)](https://fastapi.tiangolo.com/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-20%20passed-brightgreen.svg)](tests/)
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)](Dockerfile)
 
-## Features
+**Web dashboard for tracking API test results over time.** Upload JSON test reports, visualize pass rate trends, compare runs, detect regressions.
 
-- Upload test reports via API or web UI
-- Project-based organization
-- Pass rate trend charts (Chart.js)
-- Test result drill-down
-- REST API
+```
+docker compose up -d
+# Open http://localhost:8000
+```
 
-## Tech Stack
+## Why this exists
 
-- **FastAPI** - async Python web framework
-- **SQLAlchemy** - ORM with SQLite
-- **Jinja2** - server-side templates
-- **Chart.js** - pass rate trend visualization
+Running API contract tests is one thing — understanding trends is another. This dashboard:
+- Tracks pass rates across multiple runs
+- Visualizes response time trends with Chart.js
+- Compares any two reports side-by-side
+- Detects regressions automatically
+- Exports data as CSV/JSON for further analysis
 
 ## Quick Start
 
+### Docker (recommended)
+```bash
+docker compose up -d
+```
+
+### Manual
 ```bash
 pip install -e .
 uvicorn app.main:app --reload
 ```
 
-Open http://127.0.0.1:8000
+Then open http://localhost:8000 and upload a JSON report.
 
-## Upload a Report
+## Features
 
-```bash
-curl -X POST http://127.0.0.1:8000/api/upload -F "file=@report.json"
-```
-
-Report format (compatible with [API Contract Tester](https://github.com/dongjiaxi-cxk/api-contract-tester)):
-
-```json
-{
-    "project_name": "My API",
-    "summary": {"total": 10, "passed": 9, "failed": 1},
-    "results": [...]
-}
-```
+| Feature | Description |
+|---------|-------------|
+| Upload | File upload or paste JSON directly |
+| Dashboard | Project list with latest pass rates |
+| Trends | Pass rate + response time line charts |
+| Pagination | Browse large report histories |
+| Search | Filter projects by name |
+| Compare | Side-by-side diff of any two reports |
+| Export | Download as CSV or JSON |
+| Regression | Auto-detect pass rate drops |
+| Docker | One-command deployment |
+| FastAPI | Auto-generated OpenAPI docs at `/docs` |
 
 ## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | /api/projects | List projects |
-| GET | /api/projects/{id}/reports | List reports |
-| GET | /api/reports/{id} | Report detail |
-| POST | /api/upload | Upload report |
+| POST | `/api/upload` | Upload JSON report file |
+| POST | `/api/upload-text` | Upload JSON via paste |
+| GET | `/api/projects` | List projects (supports `?search=`) |
+| GET | `/api/projects/{id}/reports` | List reports |
+| GET | `/api/projects/{id}/stats` | Chart data (labels, pass_rates, avg_times) |
+| GET | `/api/projects/{id}/export?fmt=csv` | Export as CSV/JSON |
+| GET | `/api/projects/{id}/regression` | Regression check |
+| GET | `/api/compare/{id1}/{id2}` | Compare two reports |
+| DELETE | `/api/projects/{id}` | Delete project |
+| DELETE | `/api/reports/{id}` | Delete report |
+
+## Tech Stack
+
+- **FastAPI** - Web framework
+- **SQLAlchemy** + SQLite - ORM + database
+- **Chart.js** - Interactive charts
+- **Docker** - Containerized deployment
+
+## Running Tests
+
+```bash
+pip install -e .
+pytest tests/ -v
+```
+
+## License
+
+MIT
