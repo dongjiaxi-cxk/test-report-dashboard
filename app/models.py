@@ -1,7 +1,17 @@
+"""SQLAlchemy models for projects and reports."""
+
+from __future__ import annotations
+
 from datetime import datetime
+from typing import TYPE_CHECKING
+
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON, Text
 from sqlalchemy.orm import relationship
+
 from .database import Base
+
+if TYPE_CHECKING:
+    from .models import Report
 
 
 class Project(Base):
