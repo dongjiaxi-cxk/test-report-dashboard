@@ -2,6 +2,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688.svg)](https://fastapi.tiangolo.com/)
+[![CI](https://github.com/dongjiaxi-cxk/test-report-dashboard/actions/workflows/tests.yml/badge.svg)](https://github.com/dongjiaxi-cxk/test-report-dashboard/actions/workflows/tests.yml)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-20%20passed-brightgreen.svg)](tests/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)](Dockerfile)
